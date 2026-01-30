@@ -3,14 +3,21 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>時報チャイム設定</title>
+    <title>【デモ版】時報チャイム設定</title>
     <style>
+        /* 実際のアプリと同じスタイル */
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; background-color: #f8f9fa; color: #333; }
-        .header { background-color: #343a40; color: white; padding: 15px 20px; text-align: center; }
+        .header { background-color: #343a40; color: white; padding: 15px 20px; text-align: center; position: relative; }
+        .demo-badge { position: absolute; top: 10px; right: 10px; background: #ffc107; color: #000; padding: 5px 10px; font-size: 0.8em; border-radius: 4px; font-weight: bold; }
         .container { max-width: 900px; margin: 20px auto; padding: 20px; }
         
+        /* ビュー切り替え制御 */
+        .view-section { display: none; }
+        .view-section.active { display: block; }
+
         /* 通知メッセージ */
-        .flash { padding: 15px; margin-bottom: 20px; border-radius: 5px; border: 1px solid; }
+        .flash-container { margin-bottom: 20px; }
+        .flash { padding: 15px; margin-bottom: 10px; border-radius: 5px; border: 1px solid; }
         .flash.success { background-color: #d4edda; color: #155724; border-color: #c3e6cb; }
         .flash.error { background-color: #f8d7da; color: #721c24; border-color: #f5c6cb; }
 
@@ -20,15 +27,15 @@
         
         /* グループ名編集 */
         .group-name-form { display: inline-flex; align-items: center; gap: 8px; }
-        .group-name-form input[type="text"] { font-size: 1.25em; font-weight: bold; border: none; padding: 5px; border-radius: 4px; }
-        .group-name-form input[type="text"]:focus { outline: 2px solid #007bff; }
+        .group-name-form input[type="text"] { font-size: 1.25em; font-weight: bold; border: none; padding: 5px; border-radius: 4px; background: transparent; }
+        .group-name-form input[type="text"]:focus { outline: 2px solid #007bff; background: #fff; }
         .group-name-form .save-btn { font-size: 0.9em; padding: 5px 10px; }
 
         /* 一時停止フォーム */
         .pause-form .pause-btn { background-color: #ffc107; color: #212529; }
         .pause-form .resume-btn { background-color: #28a745; color: white; }
         .group-header.paused { background-color: #f8f9fa; opacity: 0.7; }
-        .group-header.paused .group-name { text-decoration: line-through; }
+        .group-header.paused .group-name-input { text-decoration: line-through; }
 
         /* 時報テーブル */
         .schedule-list { border-collapse: collapse; width: 100%; }
@@ -37,100 +44,410 @@
         .schedule-list tr:hover { background-color: #f1f3f5; }
         .schedule-list .actions { display: flex; gap: 10px; }
 
+        /* フォーム系 (Add/Edit) */
+        .form-container { max-width: 600px; margin: 0 auto; background: #fff; padding: 30px 40px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .form-grid { display: grid; gap: 20px; }
+        .form-group { display: grid; gap: 8px; }
+        label { font-weight: 600; color: #495057; }
+        input[type="time"], input[type="file"], input[type="text"], select, button {
+            padding: 12px; border: 1px solid #ced4da; border-radius: 5px; font-size: 1em; width: 100%; box-sizing: border-box;
+        }
+        .day-select { display: flex; flex-wrap: wrap; gap: 10px; padding: 10px; border: 1px solid #ced4da; border-radius: 5px; }
+        .day-select label { font-weight: normal; display: flex; align-items: center; gap: 5px; cursor: pointer; }
+        .day-select .day-all { margin-left: 15px; border-left: 1px solid #ccc; padding-left: 15px; }
+        .current-file { font-size: 0.9em; color: #6c757d; }
+
         /* ボタン共通 */
-        .btn { border: none; padding: 8px 12px; border-radius: 5px; cursor: pointer; text-decoration: none; font-size: 0.9em; white-space: nowrap; }
+        .btn { border: none; padding: 8px 12px; border-radius: 5px; cursor: pointer; text-decoration: none; font-size: 0.9em; white-space: nowrap; display: inline-block; text-align: center; }
         .btn-primary { background-color: #007bff; color: white; }
         .btn-secondary { background-color: #6c757d; color: white; }
         .btn-danger { background-color: #dc3545; color: white; }
+        .btn-success { background-color: #28a745; color: white; }
         .btn-sm { padding: 5px 10px; font-size: 0.8em; }
-
-        /* 追加ボタン */
-        .add-button-link { display: block; width: calc(100% - 40px); margin: 30px auto; padding: 15px; background-color: #007bff; color: white; text-align: center; text-decoration: none; border-radius: 5px; font-size: 1.1em; font-weight: bold; }
+        .add-button-link { display: block; width: calc(100% - 40px); margin: 30px auto; padding: 15px; background-color: #007bff; color: white; text-align: center; text-decoration: none; border-radius: 5px; font-size: 1.1em; font-weight: bold; cursor: pointer; }
         .add-button-link:hover { background-color: #0056b3; }
-        
+        .back-link { display: inline-block; margin-top: 20px; color: #007bff; text-decoration: none; cursor: pointer; }
         .no-chime { padding: 20px; text-align: center; color: #6c757d; }
+
+        /* リセットボタン (デモ用) */
+        .reset-demo { text-align: center; margin-top: 50px; font-size: 0.8em; color: #999; }
+        .reset-demo a { color: #999; cursor: pointer; }
     </style>
 </head>
 <body>
 
     <div class="header">
         <h1>時報チャイム設定</h1>
+        <div class="demo-badge">操作体験デモ</div>
     </div>
 
     <div class="container">
+        <div id="flash-container" class="flash-container"></div>
 
-        {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}
-                {% for category, message in messages %}
-                    <div classclass="flash {{ category }}">{{ message }}</div>
-                {% endfor %}
-            {% endif %}
-        {% endwith %}
-
-        {% for group in groups %}
-        <div class="group-box">
-            <div class="group-header {% if group.is_paused %}paused{% endif %}">
-                <form class="group-name-form" action="{{ url_for('update_group_name') }}" method="POST">
-                    <input type="hidden" name="group_id" value="{{ group.id }}">
-                    <input type="text" name="new_name" value="{{ group.name }}" onfocus="this.select()">
-                    <button type="submit" class="btn btn-secondary btn-sm save-btn">名前保存</button>
-                </form>
-                
-                <form class="pause-form" action="{{ url_for('toggle_group_pause') }}" method="POST">
-                    <input type="hidden" name="group_id" value="{{ group.id }}">
-                    {% if group.is_paused %}
-                        <button type="submit" class="btn resume-btn">▶ 再開</button>
-                    {% else %}
-                        <button type="submit" class="btn pause-btn">⏸ 一時停止</button>
-                    {% endif %}
-                </form>
-            </div>
-
-            <table class="schedule-list">
-                <thead>
-                    <tr>
-                        <th>時刻</th>
-                        <th>曜日</th>
-                        <th>ファイル名</th>
-                        <th>操作</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% set chimes = chimes_by_group[group.id] %}
-                    {% if chimes %}
-                        {% for chime in chimes %}
-                        <tr>
-                            <td><strong>{{ "%02d:%02d"|format(chime.hour, chime.minute) }}</strong></td>
-                            <td>
-                                {% set days = chime.days_of_week.split(',') %}
-                                {% if days|length == 7 %}
-                                    毎日
-                                {% else %}
-                                    {% for day in days %}{% if day=='0' %}月 {% endif %}{% if day=='1' %}火 {% endif %}{% if day=='2' %}水 {% endif %}{% if day=='3' %}木 {% endif %}{% if day=='4' %}金 {% endif %}{% if day=='5' %}土 {% endif %}{% if day=='6' %}日 {% endif %}{% endfor %}
-                                {% endif %}
-                            </td>
-                            <td>{{ chime.filename }}</td>
-                            <td class="actions">
-                                <a href="{{ url_for('edit_chime', chime_id=chime.id) }}" class="btn btn-secondary btn-sm">編集</a>
-                                
-                                <form action="{{ url_for('delete_chime', chime_id=chime.id) }}" method="POST" onsubmit="return confirm('本当に削除しますか？');">
-                                    <button type="submit" class="btn btn-danger btn-sm">削除</button>
-                                </form>
-                            </td>
-                        </tr>
-                        {% endfor %}
-                    {% else %}
-                        <tr>
-                            <td colspan="4" class="no-chime">このグループに登録済みの時報はありません</td>
-                        </tr>
-                    {% endif %}
-                </tbody>
-            </table>
+        <div id="view-index" class="view-section active">
+            <div id="groups-container">
+                </div>
+            <a onclick="router.go('add')" class="add-button-link">+ 新しい時報を追加</a>
         </div>
-        {% endfor %}
 
-        <a href="{{ url_for('add_chime') }}" class="add-button-link">+ 新しい時報を追加</a>
+        <div id="view-add" class="view-section">
+            <div class="form-container">
+                <h2>時報の追加</h2>
+                <form id="form-add" class="form-grid">
+                    <div class="form-group">
+                        <label>1. 時刻 (24時間形式):</label>
+                        <input type="time" name="time" required>
+                    </div>
+                    <div class="form-group">
+                        <label>2. 曜日:</label>
+                        <div class="day-select">
+                            <label><input type="checkbox" name="days" value="0">月</label>
+                            <label><input type="checkbox" name="days" value="1">火</label>
+                            <label><input type="checkbox" name="days" value="2">水</label>
+                            <label><input type="checkbox" name="days" value="3">木</label>
+                            <label><input type="checkbox" name="days" value="4">金</label>
+                            <label><input type="checkbox" name="days" value="5">土</label>
+                            <label><input type="checkbox" name="days" value="6">日</label>
+                            <label class="day-all"><input type="checkbox" id="add-check-all">毎日</label>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>3. グループ:</label>
+                        <select name="group_id" required id="add-group-select">
+                            </select>
+                    </div>
+                    <div class="form-group">
+                        <label>4. 音源ファイル (MP3):</label>
+                        <input type="file" name="file" accept=".mp3" required>
+                    </div>
+                    <button type="submit" class="btn-success">5. 登録</button>
+                </form>
+                <a onclick="router.go('index')" class="back-link">&laquo; 一覧に戻る</a>
+            </div>
+        </div>
+
+        <div id="view-edit" class="view-section">
+            <div class="form-container">
+                <h2>時報の編集</h2>
+                <form id="form-edit" class="form-grid">
+                    <input type="hidden" name="id">
+                    <div class="form-group">
+                        <label>1. 時刻 (24時間形式):</label>
+                        <input type="time" name="time" required>
+                    </div>
+                    <div class="form-group">
+                        <label>2. 曜日:</label>
+                        <div class="day-select">
+                            <label><input type="checkbox" name="days" value="0">月</label>
+                            <label><input type="checkbox" name="days" value="1">火</label>
+                            <label><input type="checkbox" name="days" value="2">水</label>
+                            <label><input type="checkbox" name="days" value="3">木</label>
+                            <label><input type="checkbox" name="days" value="4">金</label>
+                            <label><input type="checkbox" name="days" value="5">土</label>
+                            <label><input type="checkbox" name="days" value="6">日</label>
+                            <label class="day-all"><input type="checkbox" id="edit-check-all">毎日</label>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>3. グループ:</label>
+                        <select name="group_id" required id="edit-group-select">
+                            </select>
+                    </div>
+                    <div class="form-group">
+                        <label>4. 音源ファイル (MP3):</label>
+                        <p class="current-file" id="edit-current-filename">現在のファイル: sample.mp3</p>
+                        <input type="file" name="file" accept=".mp3">
+                    </div>
+                    <button type="submit" class="btn-primary">5. 更新</button>
+                </form>
+                <a onclick="router.go('index')" class="back-link">&laquo; 一覧に戻る</a>
+            </div>
+        </div>
+        
+        <div class="reset-demo">
+            <a onclick="db.resetData(); location.reload();">※データがおかしくなった場合はここをクリックして初期化</a>
+        </div>
     </div>
 
+    <script>
+        // --- 1. 擬似データベース (LocalStorageを使用) ---
+        const db = {
+            key: 'chime_demo_data_v1',
+            data: { groups: [], chimes: [] },
+            
+            init: function() {
+                const stored = localStorage.getItem(this.key);
+                if (stored) {
+                    this.data = JSON.parse(stored);
+                } else {
+                    this.resetData();
+                }
+            },
+            
+            save: function() {
+                localStorage.setItem(this.key, JSON.stringify(this.data));
+            },
+
+            resetData: function() {
+                // デモ用の初期データ
+                this.data = {
+                    groups: [
+                        { id: 1, name: 'グループ 1', is_paused: false },
+                        { id: 2, name: 'グループ 2', is_paused: false },
+                        { id: 3, name: 'グループ 3', is_paused: false },
+                        { id: 4, name: 'グループ 4', is_paused: false },
+                        { id: 5, name: 'グループ 5', is_paused: false }
+                    ],
+                    chimes: [
+                        { id: 101, hour: 12, minute: 0, days: "0,1,2,3,4,5,6", filename: "lunch_chime.mp3", group_id: 1 },
+                        { id: 102, hour: 17, minute: 30, days: "0,1,2,3,4", filename: "go_home.mp3", group_id: 1 }
+                    ]
+                };
+                this.save();
+            }
+        };
+
+        // --- 2. ルーティング & UI制御 ---
+        const router = {
+            go: function(viewName, param = null) {
+                // 全ビュー非表示
+                document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active'));
+                
+                // 対象ビュー表示
+                document.getElementById(`view-${viewName}`).classList.add('active');
+                
+                // ビューごとの初期化
+                if (viewName === 'index') app.renderIndex();
+                if (viewName === 'add') app.renderAdd();
+                if (viewName === 'edit') app.renderEdit(param);
+                
+                // 画面トップへ
+                window.scrollTo(0, 0);
+            }
+        };
+
+        // --- 3. アプリケーションロジック ---
+        const app = {
+            // ヘルパー: 通知表示
+            flash: function(msg, type = 'success') {
+                const container = document.getElementById('flash-container');
+                const div = document.createElement('div');
+                div.className = `flash ${type}`;
+                div.textContent = msg;
+                container.appendChild(div);
+                setTimeout(() => div.remove(), 4000); // 4秒後に消える
+            },
+
+            // ヘルパー: 曜日フォーマット
+            formatDays: function(daysStr) {
+                const days = daysStr.split(',');
+                if (days.length === 7) return '毎日';
+                const map = ['月', '火', '水', '木', '金', '土', '日'];
+                return days.map(d => map[d] + ' ').join('');
+            },
+
+            // ヘルパー: 時間フォーマット
+            formatTime: function(h, m) {
+                return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
+            },
+
+            // === Index画面描画 ===
+            renderIndex: function() {
+                const container = document.getElementById('groups-container');
+                container.innerHTML = '';
+
+                db.data.groups.forEach(group => {
+                    const groupChimes = db.data.chimes
+                        .filter(c => c.group_id == group.id)
+                        .sort((a, b) => (a.hour * 60 + a.minute) - (b.hour * 60 + b.minute));
+
+                    const isPausedClass = group.is_paused ? 'paused' : '';
+                    const pauseBtnLabel = group.is_paused ? '▶ 再開' : '⏸ 一時停止';
+                    const pauseBtnClass = group.is_paused ? 'resume-btn' : 'pause-btn';
+
+                    // テーブル行生成
+                    let rowsHtml = '';
+                    if (groupChimes.length > 0) {
+                        groupChimes.forEach(chime => {
+                            rowsHtml += `
+                                <tr>
+                                    <td><strong>${this.formatTime(chime.hour, chime.minute)}</strong></td>
+                                    <td>${this.formatDays(chime.days)}</td>
+                                    <td>${chime.filename}</td>
+                                    <td class="actions">
+                                        <button onclick="router.go('edit', ${chime.id})" class="btn btn-secondary btn-sm">編集</button>
+                                        <button onclick="app.deleteChime(${chime.id})" class="btn btn-danger btn-sm">削除</button>
+                                    </td>
+                                </tr>`;
+                        });
+                    } else {
+                        rowsHtml = `<tr><td colspan="4" class="no-chime">このグループに登録済みの時報はありません</td></tr>`;
+                    }
+
+                    // グループHTML組み立て
+                    const html = `
+                        <div class="group-box">
+                            <div class="group-header ${isPausedClass}">
+                                <div class="group-name-form">
+                                    <input type="text" value="${group.name}" class="group-name-input" id="g-name-${group.id}">
+                                    <button onclick="app.updateGroupName(${group.id})" class="btn btn-secondary btn-sm save-btn">名前保存</button>
+                                </div>
+                                <div class="pause-form">
+                                    <button onclick="app.togglePause(${group.id})" class="btn ${pauseBtnClass}">${pauseBtnLabel}</button>
+                                </div>
+                            </div>
+                            <table class="schedule-list">
+                                <thead><tr><th>時刻</th><th>曜日</th><th>ファイル名</th><th>操作</th></tr></thead>
+                                <tbody>${rowsHtml}</tbody>
+                            </table>
+                        </div>`;
+                    
+                    container.insertAdjacentHTML('beforeend', html);
+                });
+            },
+
+            // === Add画面描画 ===
+            renderAdd: function() {
+                const form = document.getElementById('form-add');
+                form.reset();
+                this.renderGroupSelect('add-group-select');
+            },
+
+            // === Edit画面描画 ===
+            renderEdit: function(id) {
+                const chime = db.data.chimes.find(c => c.id === id);
+                if (!chime) return router.go('index');
+
+                const form = document.getElementById('form-edit');
+                form.id.value = chime.id;
+                form.time.value = this.formatTime(chime.hour, chime.minute);
+                
+                // 曜日チェック
+                const days = chime.days.split(',');
+                form.querySelectorAll('input[name="days"]').forEach(cb => {
+                    cb.checked = days.includes(cb.value);
+                });
+                document.getElementById('edit-check-all').checked = (days.length === 7);
+
+                this.renderGroupSelect('edit-group-select', chime.group_id);
+                document.getElementById('edit-current-filename').textContent = `現在のファイル: ${chime.filename}`;
+            },
+
+            // グループ選択肢生成
+            renderGroupSelect: function(elementId, selectedId = null) {
+                const select = document.getElementById(elementId);
+                select.innerHTML = '<option value="">-- グループを選択してください --</option>';
+                db.data.groups.forEach(g => {
+                    const opt = document.createElement('option');
+                    opt.value = g.id;
+                    opt.textContent = g.name;
+                    if (g.id == selectedId) opt.selected = true;
+                    select.appendChild(opt);
+                });
+            },
+
+            // === アクション: 時報追加 ===
+            submitAdd: function(e) {
+                e.preventDefault();
+                const form = e.target;
+                const time = form.time.value;
+                const days = Array.from(form.querySelectorAll('input[name="days"]:checked')).map(cb => cb.value).join(',');
+                const groupId = form.group_id.value;
+                const fileInput = form.file;
+
+                if (!days) return this.flash('曜日を選択してください', 'error');
+                if (!groupId) return this.flash('グループを選択してください', 'error');
+                if (!fileInput.files[0]) return this.flash('ファイルを選択してください', 'error');
+
+                const [hour, minute] = time.split(':').map(Number);
+                
+                const newChime = {
+                    id: Date.now(), // 簡易ID
+                    hour, minute, days,
+                    group_id: Number(groupId),
+                    filename: fileInput.files[0].name // ファイル名だけ保存
+                };
+
+                db.data.chimes.push(newChime);
+                db.save();
+                this.flash(`時報 (${time} - ${newChime.filename}) を登録しました。`);
+                router.go('index');
+            },
+
+            // === アクション: 時報更新 ===
+            submitEdit: function(e) {
+                e.preventDefault();
+                const form = e.target;
+                const id = Number(form.id.value);
+                const chime = db.data.chimes.find(c => c.id === id);
+                
+                const days = Array.from(form.querySelectorAll('input[name="days"]:checked')).map(cb => cb.value).join(',');
+                if (!days) return this.flash('曜日を選択してください', 'error');
+
+                const [hour, minute] = form.time.value.split(':').map(Number);
+                
+                // データ更新
+                chime.hour = hour;
+                chime.minute = minute;
+                chime.days = days;
+                chime.group_id = Number(form.group_id.value);
+                
+                if (form.file.files.length > 0) {
+                    chime.filename = form.file.files[0].name;
+                }
+
+                db.save();
+                this.flash(`時報を更新しました。`);
+                router.go('index');
+            },
+
+            // === アクション: 削除 ===
+            deleteChime: function(id) {
+                if (!confirm('本当に削除しますか？')) return;
+                db.data.chimes = db.data.chimes.filter(c => c.id !== id);
+                db.save();
+                this.flash('削除しました。');
+                this.renderIndex();
+            },
+
+            // === アクション: グループ名変更 ===
+            updateGroupName: function(id) {
+                const input = document.getElementById(`g-name-${id}`);
+                const group = db.data.groups.find(g => g.id === id);
+                group.name = input.value;
+                db.save();
+                this.flash(`グループ名を「${group.name}」に変更しました。`);
+            },
+
+            // === アクション: 一時停止トグル ===
+            togglePause: function(id) {
+                const group = db.data.groups.find(g => g.id === id);
+                group.is_paused = !group.is_paused;
+                db.save();
+                const status = group.is_paused ? '一時停止' : '再開';
+                this.flash(`グループ「${group.name}」を${status}しました。`);
+                this.renderIndex();
+            }
+        };
+
+        // --- 4. イベントリスナー ---
+        document.addEventListener('DOMContentLoaded', () => {
+            db.init();
+            router.go('index');
+
+            document.getElementById('form-add').addEventListener('submit', (e) => app.submitAdd(e));
+            document.getElementById('form-edit').addEventListener('submit', (e) => app.submitEdit(e));
+
+            // 「毎日」チェックボックス制御
+            const setupCheckAll = (allId, name) => {
+                document.getElementById(allId).addEventListener('change', function() {
+                    document.querySelectorAll(`input[name="${name}"]`).forEach(cb => cb.checked = this.checked);
+                });
+            };
+            setupCheckAll('add-check-all', 'days');
+            setupCheckAll('edit-check-all', 'days');
+        });
+
+    </script>
 </body>
 </html>
