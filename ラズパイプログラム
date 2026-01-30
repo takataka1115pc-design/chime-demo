@@ -1,0 +1,541 @@
+import os
+import subprocess
+import time
+import threading
+from flask import Flask, render_template, request, redirect, url_for, flash, g, send_from_directory
+from flask_sqlalchemy import SQLAlchemy
+import RPi.GPIO as GPIO
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+from datetime import datetime, timedelta # timedelta をインポート
+from werkzeug.utils import secure_filename # secure_filename をインポート
+import logging
+
+# --- 基本設定 ---
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'mp3'}
+
+# データベース設定
+DATABASE_FILE = 'chime_app.db'
+SCHEDULER_DB_FILE = 'schedules.db'
+
+# GPIOピン設定 (BCMモード)
+RELAY_PIN = 17       # リレー (アンプ電源)
+STOP_BUTTON_PIN = 26 # 緊急停止ボタン (GPIO 26, GNDに接続)
+
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{DATABASE_FILE}'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.secret_key = 'your_very_secret_key' # 変更推奨
+
+db = SQLAlchemy(app)
+
+# --- グローバル変数 (プロセス間共有) ---
+g_stop_flag = False         # 停止ボタンが押されたか
+g_current_process = None    # 現在再生中のmpg123のプロセス
+
+# --- ログ設定 (デバッグ用) ---
+logging.basicConfig(level=logging.INFO)
+logging.getLogger('apscheduler').setLevel(logging.WARNING) # APSchedulerのログを抑制
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.WARNING) # Flaskのアクセスログを抑制
+
+# --- データベースモデル定義 ---
+
+class Group(db.Model):
+    """ グループ (1-5) """
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(80), nullable=False, default=f'グループ {id}')
+    is_paused = db.Column(db.Boolean, default=False)
+    chimes = db.relationship('Chime', backref='group', lazy=True, cascade="all, delete-orphan")
+
+class Chime(db.Model):
+    """ 時報スケジュール情報 """
+    id = db.Column(db.Integer, primary_key=True)
+    hour = db.Column(db.Integer, nullable=False)
+    minute = db.Column(db.Integer, nullable=False)
+    # 曜日 (0=月, 1=火, ..., 6=日)
+    days_of_week = db.Column(db.String(30), nullable=False, default="0,1,2,3,4,5,6") # "0,1,2" のようにカンマ区切りで保存
+    file_path = db.Column(db.String(255), nullable=False)
+    filename = db.Column(db.String(255), nullable=False)
+    group_id = db.Column(db.Integer, db.ForeignKey('group.id'), nullable=False)
+    job_id = db.Column(db.String(255), unique=True) # APSchedulerのジョブID
+
+# --- スケジューラ設定 ---
+jobstores = {
+    'default': SQLAlchemyJobStore(url=f'sqlite:///{SCHEDULER_DB_FILE}')
+}
+scheduler = BackgroundScheduler(jobstores=jobstores)
+
+
+# --- GPIO設定 ---
+def setup_gpio():
+    GPIO.setwarnings(False)
+    GPIO.setmode(GPIO.BCM)
+    # リレー (出力)
+    GPIO.setup(RELAY_PIN, GPIO.OUT)
+    GPIO.output(RELAY_PIN, GPIO.LOW) # 初期状態はオフ
+    # 停止ボタン (入力・内部プルアップ)
+    # GPIO 26 と GND の間に物理ボタンを接続
+    GPIO.setup(STOP_BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    print(f"GPIOセットアップ完了 (Relay: {RELAY_PIN}, StopButton: {STOP_BUTTON_PIN})")
+
+# --- 停止ボタン監視スレッド (ポーリング方式) ---
+def poll_stop_button():
+    """
+    停止ボタン(GPIO 26)をバックグラウンドで監視し続けるスレッド
+    """
+    global g_stop_flag, g_current_process
+    last_state = GPIO.HIGH # PULL_UPなのでHIGH(押されていない)が初期値
+
+    while True:
+        try:
+            current_state = GPIO.input(STOP_BUTTON_PIN)
+            
+            # HIGH -> LOW になった瞬間 (押された瞬間)
+            if last_state == GPIO.HIGH and current_state == GPIO.LOW:
+                if not g_stop_flag:
+                    print(f"[ButtonPoll] 停止ボタン (GPIO {STOP_BUTTON_PIN}) が押されました！")
+                    g_stop_flag = True
+                    
+                    # ★バグ修正: 現在再生中のプロセスがあれば強制終了(kill)する
+                    if g_current_process and g_current_process.poll() is None:
+                        print("[ButtonPoll] 再生中のプロセスを強制終了します。")
+                        g_current_process.kill() # Popenプロセスをkill
+                        
+                    # リレーも強制OFF
+                    GPIO.output(RELAY_PIN, GPIO.LOW)
+                    
+            last_state = current_state
+            time.sleep(0.05) # 50ms (1秒に20回) チェック
+        
+        except Exception as e:
+            print(f"[ButtonPoll] 監視スレッドエラー: {e}")
+            # RPi.GPIO が初期化されていない場合など
+            time.sleep(5) 
+
+# --- 時報再生タスク (スケジューラから呼ばれる) ---
+def chime_task(chime_id):
+    """
+    指定時刻の10秒前に呼び出されるタスク
+    1. DBから時報情報を確認 (グループ一時停止など)
+    2. アンプON
+    3. 10秒待機
+    4. MP3再生
+    5. アンプOFF
+    """
+    global g_stop_flag, g_current_process
+    
+    # Flaskのアプリコンテキスト内でDB操作を行う
+    with app.app_context():
+        try:
+            chime = Chime.query.get(chime_id)
+            if not chime:
+                print(f"[Task] chime_id {chime_id} が見つかりません。")
+                return
+            
+            group = Group.query.get(chime.group_id)
+            if not group:
+                print(f"[Task] group_id {chime.group_id} が見つかりません。")
+                return
+
+            # --- 実行前チェック ---
+            # 1. グループが一時停止中か？
+            if group.is_paused:
+                print(f"[Task] グループ '{group.name}' は一時停止中のため、スキップします。")
+                return
+            
+            # 2. 停止フラグが立っているか？ (前回の緊急停止が残っている場合)
+            if g_stop_flag:
+                print("[Task] 停止フラグが立っているため、タスクをスキップし、フラグをリセットします。")
+                g_stop_flag = False # 次のタスクのためにフラグをリセット
+                return
+                
+            print(f"--- [Task Start: {chime_id}] ---")
+            
+            # 1. アンプの電源オン (リレーON)
+            print(f"[Task {chime_id}] アンプ電源オン (PIN: {RELAY_PIN})")
+            GPIO.output(RELAY_PIN, GPIO.HIGH)
+            
+            # 2. 10秒待機 (待機中も停止ボタンをチェック)
+            print(f"[Task {chime_id}] 10秒待機...")
+            for _ in range(100): # 0.1秒 * 100回 = 10秒
+                if g_stop_flag:
+                    print(f"[Task {chime_id}] 待機中に停止ボタンが押されました。")
+                    GPIO.output(RELAY_PIN, GPIO.LOW)
+                    g_stop_flag = False # フラグリセット
+                    return
+                time.sleep(0.1)
+            
+            # 3. MP3再生
+            mp3_file_path = chime.file_path
+            print(f"[Task {chime_id}] MP3再生開始: {mp3_file_path}")
+            
+            if not os.path.exists(mp3_file_path):
+                print(f"[Task {chime_id}] エラー: ファイルが見つかりません {mp3_file_path}")
+                GPIO.output(RELAY_PIN, GPIO.LOW)
+                return
+
+            try:
+                # ★バグ修正: subprocess.run (ブロック) の代わりに Popen (非ブロック) を使う
+                p = subprocess.Popen(['mpg123', '-q', mp3_file_path])
+                g_current_process = p # グローバル変数にプロセスを保存
+                
+                p.wait() # 再生終了を待つ
+                
+                g_current_process = None # 再生終了
+                
+            except Exception as e:
+                print(f"[Task {chime_id}] MP3再生エラー: {e}")
+            
+            # 4. アンプの電源オフ (リレーOFF)
+            # (停止ボタンでkillされた場合でも、ここで再度OFFにする)
+            print(f"[Task {chime_id}] アンプ電源オフ (PIN: {RELAY_PIN})")
+            GPIO.output(RELAY_PIN, GPIO.LOW)
+            
+            if g_stop_flag:
+                print(f"[Task {chime_id}] 再生中に停止されました。フラグをリセットします。")
+                g_stop_flag = False # フラグリセット
+
+            print(f"--- [Task End: {chime_id}] ---")
+
+        except Exception as e:
+            print(f"[Task {chime_id}] タスク実行中に致命的なエラー: {e}")
+            GPIO.output(RELAY_PIN, GPIO.LOW) # 緊急停止
+            if g_stop_flag:
+                g_stop_flag = False
+
+# --- DBとスケジューラの同期 ---
+def sync_scheduler_from_db():
+    """
+    DB(Chimeテーブル)の情報を読み取り、APSchedulerにジョブを再登録する
+    (アプリ起動時や、時報の追加・編集・削除時に呼び出す)
+    """
+    if not scheduler.running:
+        print("[Sync] スケジューラが起動していません。")
+        return
+
+    print("[Sync] DBとスケジューラの同期を開始します...")
+    
+    # 1. スケジューラ上の既存ジョブをすべてクリア
+    scheduler.remove_all_jobs()
+    
+    # 2. DBからすべての時報を取得
+    all_chimes = Chime.query.all()
+    
+    for chime in all_chimes:
+        try:
+            # 実行時刻（10秒前）を計算
+            task_time = datetime(2000, 1, 1, chime.hour, chime.minute, 0)
+            task_time_dt = task_time - timedelta(seconds=10)
+            
+            # "0,1,2" 形式の曜日文字列
+            day_of_week_str = chime.days_of_week
+            
+            job_id = f"chime_job_{chime.id}"
+            
+            scheduler.add_job(
+                chime_task,
+                'cron',
+                hour=task_time_dt.hour,
+                minute=task_time_dt.minute,
+                second=task_time_dt.second,
+                day_of_week=day_of_week_str,
+                args=[chime.id],
+                id=job_id,
+                replace_existing=True
+            )
+            
+            # DBのjob_idも更新
+            chime.job_id = job_id
+            
+        except Exception as e:
+            print(f"[Sync] ジョブ登録失敗 (Chime ID: {chime.id}): {e}")
+            
+    db.session.commit()
+    print(f"[Sync] 同期完了。{len(all_chimes)}件のジョブを再登録しました。")
+    # scheduler.print_jobs() # デバッグ用
+
+
+# --- Web UI ルーティング ---
+
+@app.route('/')
+def index():
+    """ 時報一覧 (グループごと) """
+    # グループと、それに紐づく時報を取得 (時刻順にソート)
+    groups = Group.query.order_by(Group.id).all()
+    chimes_by_group = {}
+    for g in groups:
+        chimes_by_group[g.id] = Chime.query.filter_by(group_id=g.id).order_by(Chime.hour, Chime.minute).all()
+        
+    return render_template('index.html', groups=groups, chimes_by_group=chimes_by_group)
+
+@app.route('/add', methods=['GET', 'POST'])
+def add_chime():
+    """ 時報の新規追加 """
+    if request.method == 'POST':
+        try:
+            # 1. フォームデータ取得
+            chime_time_str = request.form['chime_time'] # "HH:MM"
+            group_id = request.form['group_id']
+            # 曜日 ( "0", "1", ... "6" のリスト)
+            days_of_week_list = request.form.getlist('day_of_week')
+            
+            if not group_id:
+                flash('エラー: グループが選択されていません。', 'error')
+                return redirect(url_for('add_chime'))
+            
+            if not days_of_week_list:
+                flash('エラー: 曜日が選択されていません。', 'error')
+                return redirect(url_for('add_chime'))
+
+            days_of_week_str = ",".join(days_of_week_list)
+            
+            # 2. ファイルチェックと保存
+            if 'file' not in request.files or request.files['file'].filename == '':
+                flash('エラー: ファイルが選択されていません。', 'error')
+                return redirect(url_for('add_chime'))
+            
+            file = request.files['file']
+            
+            if file and '.' in file.filename and file.filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS:
+                filename = secure_filename(file.filename)
+                mp3_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                
+                # (注意) 同名ファイルは上書きされます
+                file.save(mp3_path)
+                
+                # 3. DBに保存
+                hour, minute = map(int, chime_time_str.split(':'))
+                
+                new_chime = Chime(
+                    hour=hour,
+                    minute=minute,
+                    days_of_week=days_of_week_str,
+                    file_path=mp3_path,
+                    filename=filename,
+                    group_id=int(group_id)
+                )
+                db.session.add(new_chime)
+                db.session.commit()
+                
+                # 4. スケジューラ同期
+                sync_scheduler_from_db()
+                
+                flash(f'時報 ({hour:02}:{minute:02} - {filename}) を登録しました。', 'success')
+                return redirect(url_for('index'))
+                
+            else:
+                flash('エラー: 許可されていないファイル形式です (MP3のみ)。', 'error')
+                
+        except Exception as e:
+            db.session.rollback()
+            flash(f'登録中にエラーが発生しました: {e}', 'error')
+            print(f"[AddError] {e}")
+
+    # GET
+    groups = Group.query.order_by(Group.id).all()
+    return render_template('add.html', groups=groups)
+
+
+@app.route('/edit/<int:chime_id>', methods=['GET', 'POST'])
+def edit_chime(chime_id):
+    """ 時報の編集 """
+    chime_to_edit = Chime.query.get_or_404(chime_id)
+    
+    if request.method == 'POST':
+        try:
+            # 1. フォームデータ取得
+            chime_to_edit.hour, chime_to_edit.minute = map(int, request.form['chime_time'].split(':'))
+            chime_to_edit.group_id = int(request.form['group_id'])
+            
+            days_of_week_list = request.form.getlist('day_of_week')
+            if not days_of_week_list:
+                flash('エラー: 曜日が選択されていません。', 'error')
+                return redirect(url_for('edit_chime', chime_id=chime_id))
+            
+            chime_to_edit.days_of_week = ",".join(days_of_week_list)
+
+            # 2. ファイル (オプション)
+            file = request.files['file']
+            if file and file.filename != '':
+                if '.' in file.filename and file.filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS:
+                    # (オプション) 古いファイルを削除
+                    # if os.path.exists(chime_to_edit.file_path):
+                    #     os.remove(chime_to_edit.file_path)
+                        
+                    filename = secure_filename(file.filename)
+                    mp3_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                    file.save(mp3_path)
+                    
+                    chime_to_edit.file_path = mp3_path
+                    chime_to_edit.filename = filename
+                else:
+                    flash('エラー: 許可されていないファイル形式です (MP3のみ)。ファイルは更新されませんでした。', 'error')
+
+            # 3. DB更新
+            db.session.commit()
+            
+            # 4. スケジューラ同期
+            sync_scheduler_from_db()
+            
+            flash(f'時報 (ID: {chime_id}) を更新しました。', 'success')
+            return redirect(url_for('index'))
+
+        except Exception as e:
+            db.session.rollback()
+            flash(f'更新中にエラーが発生しました: {e}', 'error')
+            print(f"[EditError] {e}")
+    
+    # GET
+    groups = Group.query.order_by(Group.id).all()
+    # "0,1,2" を [0, 1, 2] のリストに変換
+    selected_days = [int(d) for d in chime_to_edit.days_of_week.split(',')]
+    
+    return render_template('edit.html', chime=chime_to_edit, groups=groups, selected_days=selected_days)
+
+
+@app.route('/delete/<int:chime_id>', methods=['POST'])
+def delete_chime(chime_id):
+    """ 時報の削除 """
+    try:
+        chime_to_delete = Chime.query.get(chime_id)
+        if chime_to_delete:
+            # (オプション) ファイルも削除する場合
+            # if os.path.exists(chime_to_delete.file_path):
+            #     os.remove(chime_to_delete.file_path)
+                
+            db.session.delete(chime_to_delete)
+            db.session.commit()
+            
+            # スケジューラ同期
+            sync_scheduler_from_db()
+            
+            flash(f'時報 (ID: {chime_id}) を削除しました。', 'success')
+        else:
+            flash(f'エラー: 削除対象が見つかりません (ID: {chime_id})', 'error')
+            
+    except Exception as e:
+        db.session.rollback()
+        flash(f'削除中にエラーが発生しました: {e}', 'error')
+        print(f"[DeleteError] {e}")
+        
+    return redirect(url_for('index'))
+
+
+@app.route('/update_group_name', methods=['POST'])
+def update_group_name():
+    """ グループ名の変更 (Ajax/Fetch) """
+    try:
+        group_id = request.form['group_id']
+        new_name = request.form['new_name']
+        
+        group = Group.query.get(group_id)
+        if group and new_name:
+            group.name = new_name
+            db.session.commit()
+            flash(f'グループ {group_id} の名前を「{new_name}」に変更しました。', 'success')
+        else:
+            flash('グループ名の変更に失敗しました。', 'error')
+            
+    except Exception as e:
+        db.session.rollback()
+        flash(f'グループ名変更エラー: {e}', 'error')
+        
+    return redirect(url_for('index'))
+
+
+@app.route('/toggle_group_pause', methods=['POST'])
+def toggle_group_pause():
+    """ グループの一時停止/再開 """
+    try:
+        group_id = request.form['group_id']
+        group = Group.query.get(group_id)
+        if group:
+            group.is_paused = not group.is_paused # 状態を反転
+            db.session.commit()
+            
+            status_str = "一時停止" if group.is_paused else "再開"
+            flash(f"グループ '{group.name}' を {status_str} しました。", 'success')
+        else:
+            flash('グループが見つかりません。', 'error')
+            
+    except Exception as e:
+        db.session.rollback()
+        flash(f'グループ状態の変更エラー: {e}', 'error')
+        
+    return redirect(url_for('index'))
+
+
+# --- 初期化処理 ---
+def init_db_and_groups():
+    """
+    アプリ起動時にデータベースとグループ(1-5)を初期化する
+    """
+    if not os.path.exists(DATABASE_FILE):
+        print(f"データベース {DATABASE_FILE} が見つかりません。新規作成します。")
+        db.create_all()
+        
+        # グループ1～5を自動作成
+        for i in range(1, 6):
+            if not Group.query.get(i):
+                new_group = Group(id=i, name=f'グループ {i}', is_paused=False)
+                db.session.add(new_group)
+        db.session.commit()
+        print("グループ 1～5 を作成しました。")
+    else:
+        print(f"データベース {DATABASE_FILE} は既に存在します。")
+        # 起動時にグループが存在しない場合も作成
+        for i in range(1, 6):
+            if not Group.query.get(i):
+                new_group = Group(id=i, name=f'グループ {i}', is_paused=False)
+                db.session.add(new_group)
+        db.session.commit()
+
+
+# --- メイン実行ブロック ---
+if __name__ == '__main__':
+    # 必要なフォルダがなければ作成
+    if not os.path.exists(UPLOAD_FOLDER):
+        os.makedirs(UPLOAD_FOLDER)
+    if not os.path.exists('templates'):
+        os.makedirs('templates')
+    
+    # GPIOセットアップ
+    setup_gpio()
+    
+    # アプリコンテキスト内でDB初期化
+    with app.app_context():
+        init_db_and_groups()
+    
+    # スケジューラ起動
+    if not scheduler.running:
+        scheduler.start()
+        print("スケジューラを起動しました。")
+    
+    # DBからジョブを読み込みスケジューラに登録
+    with app.app_context():
+        sync_scheduler_from_db()
+        
+    # 停止ボタン監視スレッドを開始
+    try:
+        button_thread = threading.Thread(target=poll_stop_button, daemon=True)
+        button_thread.start()
+        print(f"GPIO {STOP_BUTTON_PIN} の停止ボタン監視スレッドを開始しました。")
+    except Exception as e:
+        print(f"ボタン監視スレッドの開始に失敗: {e}")
+
+    # メインの Web サーバー実行
+    try:
+        print(f"--- 時報チャイムサーバーを起動します (PID: {os.getpid()}) ---")
+        print(f"http://[ラズパイのIPアドレス]:5000 でアクセス可能です")
+        app.run(debug=False, host='0.0.0.0', port=5000)
+    
+    except KeyboardInterrupt:
+        print("シャットダウン中...")
+    
+    finally:
+        scheduler.shutdown()
+        GPIO.cleanup()
+        print("サーバーを停止しました。")
