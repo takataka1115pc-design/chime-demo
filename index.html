@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>時報チャイム設定</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; background-color: #f8f9fa; color: #333; }
+        .header { background-color: #343a40; color: white; padding: 15px 20px; text-align: center; }
+        .container { max-width: 900px; margin: 20px auto; padding: 20px; }
+        
+        /* 通知メッセージ */
+        .flash { padding: 15px; margin-bottom: 20px; border-radius: 5px; border: 1px solid; }
+        .flash.success { background-color: #d4edda; color: #155724; border-color: #c3e6cb; }
+        .flash.error { background-color: #f8d7da; color: #721c24; border-color: #f5c6cb; }
+
+        /* グループコンテナ */
+        .group-box { background: #fff; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 25px; }
+        .group-header { padding: 15px 20px; border-bottom: 1px solid #e9ecef; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; }
+        
+        /* グループ名編集 */
+        .group-name-form { display: inline-flex; align-items: center; gap: 8px; }
+        .group-name-form input[type="text"] { font-size: 1.25em; font-weight: bold; border: none; padding: 5px; border-radius: 4px; }
+        .group-name-form input[type="text"]:focus { outline: 2px solid #007bff; }
+        .group-name-form .save-btn { font-size: 0.9em; padding: 5px 10px; }
+
+        /* 一時停止フォーム */
+        .pause-form .pause-btn { background-color: #ffc107; color: #212529; }
+        .pause-form .resume-btn { background-color: #28a745; color: white; }
+        .group-header.paused { background-color: #f8f9fa; opacity: 0.7; }
+        .group-header.paused .group-name { text-decoration: line-through; }
+
+        /* 時報テーブル */
+        .schedule-list { border-collapse: collapse; width: 100%; }
+        .schedule-list th, .schedule-list td { padding: 12px 20px; text-align: left; border-top: 1px solid #e9ecef; }
+        .schedule-list th { background-color: #f8f9fa; font-weight: 600; }
+        .schedule-list tr:hover { background-color: #f1f3f5; }
+        .schedule-list .actions { display: flex; gap: 10px; }
+
+        /* ボタン共通 */
+        .btn { border: none; padding: 8px 12px; border-radius: 5px; cursor: pointer; text-decoration: none; font-size: 0.9em; white-space: nowrap; }
+        .btn-primary { background-color: #007bff; color: white; }
+        .btn-secondary { background-color: #6c757d; color: white; }
+        .btn-danger { background-color: #dc3545; color: white; }
+        .btn-sm { padding: 5px 10px; font-size: 0.8em; }
+
+        /* 追加ボタン */
+        .add-button-link { display: block; width: calc(100% - 40px); margin: 30px auto; padding: 15px; background-color: #007bff; color: white; text-align: center; text-decoration: none; border-radius: 5px; font-size: 1.1em; font-weight: bold; }
+        .add-button-link:hover { background-color: #0056b3; }
+        
+        .no-chime { padding: 20px; text-align: center; color: #6c757d; }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h1>時報チャイム設定</h1>
+    </div>
+
+    <div class="container">
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div classclass="flash {{ category }}">{{ message }}</div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        {% for group in groups %}
+        <div class="group-box">
+            <div class="group-header {% if group.is_paused %}paused{% endif %}">
+                <form class="group-name-form" action="{{ url_for('update_group_name') }}" method="POST">
+                    <input type="hidden" name="group_id" value="{{ group.id }}">
+                    <input type="text" name="new_name" value="{{ group.name }}" onfocus="this.select()">
+                    <button type="submit" class="btn btn-secondary btn-sm save-btn">名前保存</button>
+                </form>
+                
+                <form class="pause-form" action="{{ url_for('toggle_group_pause') }}" method="POST">
+                    <input type="hidden" name="group_id" value="{{ group.id }}">
+                    {% if group.is_paused %}
+                        <button type="submit" class="btn resume-btn">▶ 再開</button>
+                    {% else %}
+                        <button type="submit" class="btn pause-btn">⏸ 一時停止</button>
+                    {% endif %}
+                </form>
+            </div>
+
+            <table class="schedule-list">
+                <thead>
+                    <tr>
+                        <th>時刻</th>
+                        <th>曜日</th>
+                        <th>ファイル名</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% set chimes = chimes_by_group[group.id] %}
+                    {% if chimes %}
+                        {% for chime in chimes %}
+                        <tr>
+                            <td><strong>{{ "%02d:%02d"|format(chime.hour, chime.minute) }}</strong></td>
+                            <td>
+                                {% set days = chime.days_of_week.split(',') %}
+                                {% if days|length == 7 %}
+                                    毎日
+                                {% else %}
+                                    {% for day in days %}{% if day=='0' %}月 {% endif %}{% if day=='1' %}火 {% endif %}{% if day=='2' %}水 {% endif %}{% if day=='3' %}木 {% endif %}{% if day=='4' %}金 {% endif %}{% if day=='5' %}土 {% endif %}{% if day=='6' %}日 {% endif %}{% endfor %}
+                                {% endif %}
+                            </td>
+                            <td>{{ chime.filename }}</td>
+                            <td class="actions">
+                                <a href="{{ url_for('edit_chime', chime_id=chime.id) }}" class="btn btn-secondary btn-sm">編集</a>
+                                
+                                <form action="{{ url_for('delete_chime', chime_id=chime.id) }}" method="POST" onsubmit="return confirm('本当に削除しますか？');">
+                                    <button type="submit" class="btn btn-danger btn-sm">削除</button>
+                                </form>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    {% else %}
+                        <tr>
+                            <td colspan="4" class="no-chime">このグループに登録済みの時報はありません</td>
+                        </tr>
+                    {% endif %}
+                </tbody>
+            </table>
+        </div>
+        {% endfor %}
+
+        <a href="{{ url_for('add_chime') }}" class="add-button-link">+ 新しい時報を追加</a>
+    </div>
+
+</body>
+</html>
